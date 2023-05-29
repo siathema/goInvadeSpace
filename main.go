@@ -1,8 +1,9 @@
 package main
 
 import (
-    "fmt"
-    "os"
+	"errors"
+	"fmt"
+	"os"
 )
 
 func Kilobytes(kb uint) uint {
@@ -16,7 +17,7 @@ type Bus16 uint16
 type MemoryMap struct {
     DBus *Bus8
     ABus *Bus16
-    Write bool
+    WriteEnable bool
     Rom, Ram []uint8
 }
 
@@ -39,8 +40,20 @@ func (mem *MainMemory) Read(addr uint16) uint8 {
     }
 }
 
+func (mem *MainMemory) Write(addr uint16, data uint8) error {
+    if uint(addr) < Kilobytes(8) {
+        mem.Rom[addr] = data    
+        return nil
+    }  else if uint(addr) < Kilobytes(16) {
+        mem.Ram[addr - uint16(Kilobytes(8))] = data
+        return nil
+    } else {
+        return errors.New("Address out of bounds!")
+    }
+}
+
 type Core8080 struct {
-    A, B, C, D, E, H, L uint8
+    A, B, C, D, E, H, L, Flags uint8
     SP, PC uint16
     DBus *Bus8
     ABus *Bus16
@@ -56,6 +69,7 @@ func (core *Core8080) Init(dataBus *Bus8, addrBus *Bus16) {
     core.E = 0
     core.H = 0
     core.L = 0
+    core.Flags = 0
     core.DBus = dataBus
     core.ABus = addrBus
     core.Irq = false
@@ -72,23 +86,66 @@ func (core *Core8080) RunTick(mem *MainMemory) {
     for i :=0; i < 3; i++ {
         opcode[i] = mem.Read(core.PC + uint16(i))
     }
-    core.ExecuteOpcode(opcode)
+    core.ExecuteOpcode(opcode, mem)
 
 }
 
-func (core *Core8080) ExecuteOpcode(opcode []uint8) {
+func (core *Core8080) UpdateFlags(after uint8, carry bool) {
+    // Zero flag
+    if(after == 0) {
+        core.Flags |= 0x40
+    } else {
+        core.Flags &= 0xBF
+    }
+    // Negative flag
+    if((after & 0x80) != 0) {
+        core.Flags |= 0x80
+    } else {
+        core.Flags &= 0x70
+    }
+    // Parity flag
+    p := 0
+    for i := 0; i < 8; i++ {
+        if((after >> i) & 0x01 != 0) {
+            p++
+        }
+    }
+    if (p % 2 == 0) {
+        core.Flags |= 0x04
+    } else {
+        core.Flags &= 0xfb
+    }
+    //carry
+    if carry {
+        core.Flags |= 0x01
+    } else {
+        core.Flags &= 0xFE
+    }
+}
+
+func (core *Core8080) ExecuteOpcode(opcode []uint8, mem *MainMemory) {
     switch opcode[0] {
     case 0x00: 	   //NOP	1		
         fmt.Printf("NOP\n")
         core.PC++
     case 0x01://LXI B,D16	3		B <- byte 3, C <- byte 2
         fmt.Printf("NLXI B,D16\n")
+        core.B = opcode[2]
+        core.C = opcode[1]
         core.PC += 3
     case 0x02://STAX B	1		(BC) <- A
         core.PC++
+        addr := uint16(core.B) << 8
+        addr |= uint16(core.C)
+        mem.Write(addr, core.A)
         fmt.Printf("STAX B\n")
     case 0x03://INX B	1		BC <- BC+1
         core.PC++
+        item := uint16(core.B) << 8
+        item |= uint16(core.C)
+        item++
+        core.C = uint8(item)
+        core.B = uint8(item >> 8)
         fmt.Printf("INX B\n")
     case 0x04://INR B	1	Z, S, P, AC	B <- B+1
         fmt.Printf("INR B\n")
@@ -98,6 +155,7 @@ func (core *Core8080) ExecuteOpcode(opcode []uint8) {
         core.PC++
     case 0x06://MVI B, D8	2		B <- byte 2
         fmt.Printf("MVI B\n")
+        core.B = opcode[1]
         core.PC += 2
     case 0x07://RLC	1	CY	A = A << 1; bit 0 = prev bit 7; CY = prev bit 7
         fmt.Printf("RLC\n")
@@ -110,54 +168,123 @@ func (core *Core8080) ExecuteOpcode(opcode []uint8) {
         core.PC++
     case 0x0a://LDAX B	1		A <- (BC)
         fmt.Printf("LDAX B\n")
+        addr := uint16(core.B) << 8
+        addr |= uint16(core.C)
+        core.A = mem.Read(addr)
         core.PC++
     case 0x0b://DCX B	1		BC = BC-1
         fmt.Printf("DCX B\n")
+        item := uint16(core.B) << 8
+        item |= uint16(core.C)
+        item--
+        core.C = uint8(item)
+        core.B = uint8(item >> 8)
         core.PC++
     case 0x0c://INR C	1	Z, S, P, AC	C <- C+1
         fmt.Printf("INR C\n")
+        temp := core.C + 1
+        carry := temp < core.C
+        core.UpdateFlags(temp, carry)
+        core.C = temp 
         core.PC++
     case 0x0d://DCR C	1	Z, S, P, AC	C <-C-1
         fmt.Printf("DCR C\n")
+        temp := core.C - 1
+        carry := temp > core.C
+        core.UpdateFlags(temp, carry)
+        core.C = temp 
         core.PC++
     case 0x0e://MVI C,D8	2		C <- byte 2
         fmt.Printf("MVI C, D8\n")
+        core.C = opcode[1]
         core.PC += 2
     case 0x0f://RRC	1	CY	A = A >> 1; bit 7 = prev bit 0; CY = prev bit 0
         fmt.Printf("RRC\n")
+        carry := (core.A & 0x01) != 0
+        core.A >>= 1
+        if carry {
+            core.A |= 0x80
+            core.Flags |= 0x01
+        } else {
+            core.Flags &= 0xFE
+        } 
         core.PC++
     case 0x10://-			
         fmt.Printf("Invalid Instruction\n")
         core.PC++
     case 0x11://LXI D,D16	3		D <- byte 3, E <- byte 2
         fmt.Printf("LXI D, D16\n")
+        core.D = opcode[1]
+        core.E = opcode[2]
         core.PC += 3
     case 0x12://STAX D	1		(DE) <- A
         fmt.Printf("STAX D\n")
+        addr := uint16(core.D) << 8
+        addr |= uint16(core.E)
+        mem.Write(addr, core.A)
         core.PC++
     case 0x13://INX D	1		DE <- DE + 1
         fmt.Printf("INX D\n")
+        temp := uint16(core.D) << 8
+        temp |= uint16(core.E)
+        temp++
+        core.E = uint8(core.E)
+        core.D = uint8(core.D >> 8)
         core.PC++
     case 0x14://INR D	1	Z, S, P, AC	D <- D+1
         fmt.Printf("INR D\n")
+        temp := core.D + 1
+        carry := temp < core.D
+        core.UpdateFlags(temp, carry)
+        core.D = temp 
         core.PC++
     case 0x15://DCR D	1	Z, S, P, AC	D <- D-1
         fmt.Printf("DCR D\n")
+        temp := core.D - 1
+        carry := temp > core.D
+        core.UpdateFlags(temp, carry)
+        core.D = temp 
         core.PC++
     case 0x16://MVI D, D8	2		D <- byte 2
         fmt.Printf("MVI D, D8\n")
+        core.D = opcode[1]
         core.PC += 2
     case 0x17://RAL	1	CY	A = A << 1; bit 0 = prev CY; CY = prev bit 7
         fmt.Printf("RAL\n")
+        carry := (core.A & 0x80) != 0
+        core.A <<= 1
+        if carry {
+            core.A |= 0x80
+            core.Flags |= 0x01
+        } else {
+            core.Flags &= 0xFE
+        } 
         core.PC++
     case 0x18://-			
         fmt.Printf("Invalid Instruction\n")
         core.PC++
     case 0x19://DAD D	1	CY	HL = HL + DE
         fmt.Printf("DAD D\n")
+        temp1 := uint16(core.H) << 8
+        temp1 |= uint16(core.L)
+        temp2 := uint16(core.D) << 8
+        temp2 |= uint16(core.E)
+        temp3 := temp1 + temp2
+        carry := temp3 <= temp1 || temp3 <= temp2
+        if carry {
+            core.A |= 0x80
+            core.Flags |= 0x01
+        } else {
+            core.Flags &= 0xFE
+        } 
+        core.L = uint8(temp3)
+        core.H = uint8(temp3 >> 8)
         core.PC++
     case 0x1a://LDAX D	1		A <- (DE)
         fmt.Printf("LDAX D\n")
+        addr := uint16(core.D) << 8
+        addr |= uint16(core.E)
+        core.A = mem.Read(addr)
         core.PC++
     case 0x1b://DCX D	1		DE = DE-1
         fmt.Printf("DCX D\n")
@@ -275,189 +402,274 @@ func (core *Core8080) ExecuteOpcode(opcode []uint8) {
         core.PC++
     case 0x41://MOV B,C	1		B <- C
         fmt.Printf("MOV B, C\n")
+        core.B = core.C
         core.PC++
     case 0x42://MOV B,D	1		B <- D
         fmt.Printf("MOV B, D\n")
+        core.B = core.D
         core.PC++
     case 0x43://MOV B,E	1		B <- E
         fmt.Printf("MOV B, E\n")
+        core.B = core.E
         core.PC++
     case 0x44://MOV B,H	1		B <- H
         fmt.Printf("MOV B, H\n")
+        core.B = core.H
         core.PC++
     case 0x45://MOV B,L	1		B <- L
         fmt.Printf("MOV B, L\n")
+        core.B = core.L
         core.PC++
     case 0x46://MOV B,M	1		B <- (HL)
         fmt.Printf("MOV B, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.B = mem.Read(addr)
         core.PC++
     case 0x47://MOV B,A	1		B <- A
         fmt.Printf("MOV B, A\n")
+        core.B = core.A
         core.PC++
     case 0x48://MOV C,B	1		C <- B
         fmt.Printf("MOV C, B\n")
+        core.C = core.B
         core.PC++
     case 0x49://MOV C,C	1		C <- C
         fmt.Printf("MOV C, C\n")
         core.PC++
     case 0x4a://MOV C,D	1		C <- D
         fmt.Printf("MOV C, D\n")
+        core.C = core.D
         core.PC++
     case 0x4b://MOV C,E	1		C <- E
         fmt.Printf("MOV C, E\n")
+        core.C = core.E
         core.PC++
     case 0x4c://MOV C,H	1		C <- H
         fmt.Printf("MOV C, H\n")
+        core.C = core.H
         core.PC++
     case 0x4d://MOV C,L	1		C <- L
         fmt.Printf("MOV C, L\n")
+        core.C = core.L
         core.PC++
     case 0x4e://MOV C,M	1		C <- (HL)
         fmt.Printf("MOV C, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.C = mem.Read(addr)
         core.PC++
     case 0x4f://MOV C,A	1		C <- A
         fmt.Printf("MOV C, A\n")
+        core.C = core.A
         core.PC++
     case 0x50://MOV D,B	1		D <- B
         fmt.Printf("MOV D, B\n")
+        core.D = core.B
         core.PC++
     case 0x51://MOV D,C	1		D <- C
         fmt.Printf("MOV D, C\n")
+        core.D = core.C
         core.PC++
     case 0x52://MOV D,D	1		D <- D
         fmt.Printf("MOV D, D\n")
+        core.D = core.D
         core.PC++
     case 0x53://MOV D,E	1		D <- E
         fmt.Printf("MOV D, E\n")
+        core.D = core.E
         core.PC++
     case 0x54://MOV D,H	1		D <- H
         fmt.Printf("MOV D, H\n")
+        core.D = core.H
         core.PC++
     case 0x55://MOV D,L	1		D <- L
         fmt.Printf("MOV D, L\n")
+        core.D = core.L
         core.PC++
     case 0x56://MOV D,M	1		D <- (HL)
         fmt.Printf("MOV D, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.D = mem.Read(addr)
         core.PC++
     case 0x57://MOV D,A	1		D <- A
         fmt.Printf("MOV D, A\n")
+        core.D = core.A
         core.PC++
     case 0x58://MOV E,B	1		E <- B
         fmt.Printf("MOV E, B\n")
+        core.E = core.B
         core.PC++
     case 0x59://MOV E,C	1		E <- C
         fmt.Printf("MOV E, C\n")
+        core.E = core.C
         core.PC++
     case 0x5a://MOV E,D	1		E <- D
         fmt.Printf("MOV E, D\n")
+        core.E = core.D
         core.PC++
     case 0x5b://MOV E,E	1		E <- E
         fmt.Printf("MOV E, E\n")
         core.PC++
     case 0x5c://MOV E,H	1		E <- H
         fmt.Printf("MOV E, H\n")
+        core.E = core.H
         core.PC++
     case 0x5d://MOV E,L	1		E <- L
         fmt.Printf("MOV E, L\n")
+        core.E = core.L
         core.PC++
     case 0x5e://MOV E,M	1		E <- (HL)
         fmt.Printf("MOV E, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.E = mem.Read(addr)
         core.PC++
     case 0x5f://MOV E,A	1		E <- A
         fmt.Printf("MOV E, A\n")
+        core.E = core.A
         core.PC++
     case 0x60://MOV H,B	1		H <- B
         fmt.Printf("MOV H, B\n")
+        core.H = core.B
         core.PC++
     case 0x61://MOV H,C	1		H <- C
         fmt.Printf("MOV H, C\n")
+        core.H = core.B
         core.PC++
     case 0x62://MOV H,D	1		H <- D
         fmt.Printf("MOV H, D\n")
+        core.H = core.D
         core.PC++
     case 0x63://MOV H,E	1		H <- E
         fmt.Printf("MOV H, E\n")
+        core.H = core.E
         core.PC++
     case 0x64://MOV H,H	1		H <- H
         fmt.Printf("MOV H, H\n")
         core.PC++
     case 0x65://MOV H,L	1		H <- L
         fmt.Printf("MOV H, L\n")
+        core.H = core.L
         core.PC++
     case 0x66://MOV H,M	1		H <- (HL)
         fmt.Printf("MOV H, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.H = mem.Read(addr)
         core.PC++
     case 0x67://MOV H,A	1		H <- A
         fmt.Printf("MOV H, A\n")
+        core.H = core.A
         core.PC++
     case 0x68://MOV L,B	1		L <- B
         fmt.Printf("MOV L, B\n")
+        core.L = core.B
         core.PC++
     case 0x69://MOV L,C	1		L <- C
         fmt.Printf("MOV L, C\n")
+        core.L = core.C
         core.PC++
     case 0x6a://MOV L,D	1		L <- D
         fmt.Printf("MOV L, D\n")
+        core.L = core.D
         core.PC++
     case 0x6b://MOV L,E	1		L <- E
         fmt.Printf("MOV L, E\n")
+        core.L = core.E
         core.PC++
     case 0x6c://MOV L,H	1		L <- H
         fmt.Printf("MOV L, H\n")
+        core.L = core.H
         core.PC++
     case 0x6d://MOV L,L	1		L <- L
         fmt.Printf("MOV L, L\n")
         core.PC++
     case 0x6e://MOV L,M	1		L <- (HL)
         fmt.Printf("MOV L, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.L = mem.Read(addr)
         core.PC++
     case 0x6f://MOV L,A	1		L <- A
         fmt.Printf("MOV L, A\n")
+        core.L = core.A
         core.PC++
     case 0x70://MOV M,B	1		(HL) <- B
         fmt.Printf("MOV M, B\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.B)
         core.PC++
     case 0x71://MOV M,C	1		(HL) <- C
         fmt.Printf("MOV M, C\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.C)
         core.PC++
     case 0x72://MOV M,D	1		(HL) <- D
         fmt.Printf("MOV M, D\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.D)
         core.PC++
     case 0x73://MOV M,E	1		(HL) <- E
         fmt.Printf("MOV M, E\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.E)
         core.PC++
     case 0x74://MOV M,H	1		(HL) <- H
         fmt.Printf("MOV M, H\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.H)
         core.PC++
     case 0x75://MOV M,L	1		(HL) <- L
         fmt.Printf("MOV M, L\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.L)
         core.PC++
     case 0x76://HLT	1		special
         fmt.Printf("HLT\n")
         core.PC++
     case 0x77://MOV M,A	1		(HL) <- A
         fmt.Printf("MOV M, A\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        mem.Write(addr, core.A)
         core.PC++
     case 0x78://MOV A,B	1		A <- B
         fmt.Printf("MOV A, B\n")
+        core.A = core.B
         core.PC++
     case 0x79://MOV A,C	1		A <- C
         fmt.Printf("MOV A, C\n")
+        core.A = core.C
         core.PC++
     case 0x7a://MOV A,D	1		A <- D
         fmt.Printf("MOV A, D\n")
+        core.A = core.D
         core.PC++
     case 0x7b://MOV A,E	1		A <- E
         fmt.Printf("MOV A, E\n")
+        core.A = core.E
         core.PC++
     case 0x7c://MOV A,H	1		A <- H
         fmt.Printf("MOV A, H\n")
+        core.A = core.L
         core.PC++
     case 0x7d://MOV A,L	1		A <- L
         fmt.Printf("MOV A, L\n")
+        core.A = core.L
         core.PC++
     case 0x7e://MOV A,M	1		A <- (HL)
         fmt.Printf("MOV A, M\n")
+        addr := uint16(core.H) << 8
+        addr |= uint16(core.L)
+        core.A = mem.Read(addr)
         core.PC++
     case 0x7f://MOV A,A	1		A <- A
         fmt.Printf("MOV A, A\n")
@@ -665,7 +877,9 @@ func (core *Core8080) ExecuteOpcode(opcode []uint8) {
         core.PC += 3
     case 0xc3://JMP adr	3		PC <= adr
         fmt.Printf("JMP adr\n")
-        core.PC += 3
+        addr := uint16(opcode[2]) << 8
+        addr |= uint16(opcode[1])
+        core.PC += addr
     case 0xc4://CNZ adr	3		if NZ, CALL adr
         fmt.Printf("CNZ adr\n")
         core.PC += 3
