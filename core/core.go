@@ -34,6 +34,18 @@ func (core *Core8080) RunTick(mem *memory.MainMemory) {
 
 }
 
+func u8HiLowRoU16(hi uint8, low uint8) uint16 {
+    addr := uint16(hi) << 8
+    addr |= uint16(low)
+    return addr
+}
+
+func u16ToHiLowU8(n uint16) (uint8, uint8) {
+    l := uint8(n)
+    h := uint8(n >> 8)
+    return h, l 
+}
+
 func (core *Core8080) UpdateFlags(after uint8, carry bool) {
     // Zero flag
     if(after == 0) {
@@ -73,7 +85,7 @@ func (core *Core8080) ExecuteOpcode(opcode []uint8, mem *memory.MainMemory) {
         fmt.Printf("NOP\n")
         core.PC++
     case 0x01://LXI B,D16	3		B <- byte 3, C <- byte 2
-        fmt.Printf("NLXI B,D16\n")
+        fmt.Printf("LXI B,D16\n")
         core.B = opcode[2]
         core.C = opcode[1]
         core.PC += 3
@@ -85,11 +97,9 @@ func (core *Core8080) ExecuteOpcode(opcode []uint8, mem *memory.MainMemory) {
         fmt.Printf("STAX B\n")
     case 0x03://INX B	1		BC <- BC+1
         core.PC++
-        item := uint16(core.B) << 8
-        item |= uint16(core.C)
+        item := u8HiLowRoU16(core.B, core.C)
         item++
-        core.C = uint8(item)
-        core.B = uint8(item >> 8)
+        core.C, core.B = u16ToHiLowU8(item)
         fmt.Printf("INX B\n")
     case 0x04://INR B	1	Z, S, P, AC	B <- B+1
         fmt.Printf("INR B\n")
